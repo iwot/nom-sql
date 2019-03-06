@@ -16,12 +16,14 @@ use keywords::escape_if_keyword;
 use order::{order_type, OrderType};
 use select::{nested_selection, SelectStatement};
 use table::Table;
+use foreignkey::{ForeignKeySpecification};
 
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct CreateTableStatement {
     pub table: Table,
     pub fields: Vec<ColumnSpecification>,
     pub keys: Option<Vec<TableKey>>,
+    pub fkeys: Option<Vec<ForeignKeySpecification>>,
 }
 
 impl fmt::Display for CreateTableStatement {
@@ -43,6 +45,16 @@ impl fmt::Display for CreateTableStatement {
                 ", {}",
                 keys.iter()
                     .map(|key| format!("{}", key))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+        }
+        if let Some(ref fkeys) = self.fkeys {
+            write!(
+                f,
+                ", {}",
+                fkeys.iter()
+                    .map(|fkey| format!("{}", fkey))
                     .collect::<Vec<_>>()
                     .join(", ")
             )?;
@@ -321,6 +333,112 @@ named!(pub column_constraint<CompleteByteSlice, Option<ColumnConstraint>>,
     )
 );
 
+/// Parse rule for a comma-separated list.
+named!(pub field_fk_specification_list<CompleteByteSlice, Vec<Column>>,
+    many1!(
+        do_parse!(
+            opt_multispace >>
+            column: sql_identifier >>
+            opt_multispace >>
+            opt!(
+                do_parse!(
+                    opt_multispace >>
+                    tag!(",") >>
+                    opt_multispace >>
+                    ()
+                )
+            ) >>
+            ({
+                Column {
+                    name: String::from_utf8(column.to_vec()).unwrap(),
+                    alias: None,
+                    table: None,
+                    function: None,
+                }
+            })
+        )
+    )
+);
+
+named!(pub foreign_key_ref_action_list<CompleteByteSlice, Vec<String> >,
+    many1!(
+        do_parse!(
+            opt_multispace >>
+            tag_no_case!("ON") >>
+            multispace >>
+            name: alt!(tag_no_case!("DELETE") | tag_no_case!("UPDATE")) >>
+            multispace >>
+            tag_no_case!("RESTRICT") >>
+            ({String::from_utf8(name.to_vec()).unwrap()})
+        )
+    ));
+
+/// Parse rule for CONSTRAINT FOREIGN KEY list.
+named!(pub foreign_key_specification_list<CompleteByteSlice, Vec<ForeignKeySpecification> >,
+       many1!(
+           do_parse!(
+               name: opt!(do_parse!(
+                           opt_multispace >>
+                           tag_no_case!("CONSTRAINT") >>
+                           opt_multispace >>
+                           name: sql_identifier >>
+                           (name)
+                     )) >>
+               opt_multispace >>
+               tag_no_case!("foreign") >>
+               multispace >>
+               tag_no_case!("key") >>
+               opt_multispace >>
+               tag!("(") >>
+               fromfields: field_fk_specification_list >>
+               tag!(")") >>
+               opt_multispace >>
+               tag_no_case!("REFERENCES") >>
+               multispace >>
+               that_table: table_reference >>
+               opt_multispace >>
+               tag!("(") >>
+               tofields: field_fk_specification_list >>
+               tag!(")") >>
+               ref_act: opt!(do_parse!(
+                   act: foreign_key_ref_action_list >>
+                   (act)
+               )) >>
+               opt_multispace >>
+               opt!(
+                   do_parse!(
+                       opt_multispace >>
+                       tag!(",") >>
+                       opt_multispace >>
+                       ()
+                   )
+               ) >>
+               ({
+                   let ref_action = if let Some(ref_act) = ref_act {
+                        Some(
+                            ref_act.into_iter().map(|a| {
+                                    format!("ON {} RESTRICT", a)
+                                }).collect::<Vec<_>>().join(" ")
+                        )
+                   } else {
+                       None
+                   };
+                   ForeignKeySpecification {
+                       name: if let Some(name) = name {
+                           Some(String::from_utf8(name.to_vec()).unwrap())
+                       } else {
+                           None
+                       },
+                       ref_action: ref_action,
+                       from: fromfields,
+                       that_table: that_table,
+                       to: tofields,
+                   }
+               })
+           )
+       )
+);
+
 /// Parse rule for a SQL CREATE TABLE query.
 /// TODO(malte): support types, TEMPORARY tables, IF NOT EXISTS, AS stmt
 named!(pub creation<CompleteByteSlice, CreateTableStatement>,
@@ -336,6 +454,8 @@ named!(pub creation<CompleteByteSlice, CreateTableStatement>,
         fields: field_specification_list >>
         opt_multispace >>
         keys: opt!(key_specification_list) >>
+        opt_multispace >>
+        fkeys: opt!(foreign_key_specification_list) >>
         opt_multispace >>
         tag!(")") >>
         opt_multispace >>
@@ -395,6 +515,7 @@ named!(pub creation<CompleteByteSlice, CreateTableStatement>,
                 table: table,
                 fields: named_fields,
                 keys: named_keys,
+                fkeys: fkeys,
             }
         })
     )
@@ -807,5 +928,59 @@ mod tests {
         let expected = "CREATE VIEW v AS SELECT * FROM t";
         let res = view_creation(CompleteByteSlice(qstring.as_bytes()));
         assert_eq!(format!("{}", res.unwrap().1), expected);
+    }
+
+    #[test]
+    fn table_foreign_key_spec() {
+        let qstring = "FOREIGN KEY(this1, this2) REFERENCES that_table(that1, that2),FOREIGN KEY(this3) REFERENCES that_table2(that3),";
+
+        let res = foreign_key_specification_list(CompleteByteSlice(qstring.as_bytes()));
+        let resclone = res.clone();
+        println!("{:?}", resclone);
+        assert_eq!(
+            res.unwrap().1,
+            vec![
+                ForeignKeySpecification::new(None, None, vec![Column::from("this1"), Column::from("this2")], Table::from("that_table"), vec![Column::from("that1"), Column::from("that2")]),
+                ForeignKeySpecification::new(None, None, vec![Column::from("this3")], Table::from("that_table2"), vec![Column::from("that3")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn format_create_with_foreign_key() {
+        let qstring = "CREATE TABLE `auth_group` (
+                       `id` integer AUTO_INCREMENT NOT NULL PRIMARY KEY,
+                       `name` varchar(80) NOT NULL UNIQUE,
+                       FOREIGN KEY(`name`) REFERENCES artist(`name`))";
+        let expected = "CREATE TABLE auth_group (\
+                        id INT(32) AUTO_INCREMENT NOT NULL PRIMARY KEY, \
+                        name VARCHAR(80) NOT NULL UNIQUE, \
+                        FOREIGN KEY(name) REFERENCES artist(name))";
+        let res = creation(CompleteByteSlice(qstring.as_bytes()));
+        assert_eq!(format!("{}", res.unwrap().1), expected);
+    }
+
+    #[test]
+    fn foreign_key() {
+        let qstring = "FOREIGN KEY(`name`) REFERENCES artist(`name`)";
+        let expected = "FOREIGN KEY(name) REFERENCES artist(name)";
+        let res = foreign_key_specification_list(CompleteByteSlice(qstring.as_bytes()));
+        assert_eq!(format!("{}", res.unwrap().1[0]), expected);
+    }
+
+    #[test]
+    fn foreign_key2() {
+        let qstring = "FOREIGN KEY   (   `name`   )    REFERENCES   artist    (  `name`  )";
+        let expected = "FOREIGN KEY(name) REFERENCES artist(name)";
+        let res = foreign_key_specification_list(CompleteByteSlice(qstring.as_bytes()));
+        assert_eq!(format!("{}", res.unwrap().1[0]), expected);
+    }
+
+    #[test]
+    fn foreign_key3() {
+        let qstring = "CONSTRAINT fk_name FOREIGN KEY(`name`) REFERENCES artist(`name`)";
+        let expected = "CONSTRAINT fk_name FOREIGN KEY(name) REFERENCES artist(name)";
+        let res = foreign_key_specification_list(CompleteByteSlice(qstring.as_bytes()));
+        assert_eq!(format!("{}", res.unwrap().1[0]), expected);
     }
 }
